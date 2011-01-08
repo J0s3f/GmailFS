@@ -1687,7 +1687,10 @@ class Gmailfs(Fuse):
 	body = fixQuotedPrintable(inode.inode_msg.as_string())
         m = re.search(SymlinkTag+'='+LinkStartDelim+'(.*)'+
                       LinkEndDelim,body)
-        return m.group(1)
+        link_target = m.group(1)
+        link_target = _pathSeparatorDecode(link_target)
+	return link_target
+
     #@-node:readlink
 
    #@+node:readdir
