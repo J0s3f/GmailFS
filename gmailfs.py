@@ -254,12 +254,19 @@ def log_warning(str):
 	return
 
 def parse_path(path):
-	# should we check that there's always a / in the path??
-	ind = string.rindex(path, '/')
-	parent_dir = path[:ind]
-        filename = path[ind+1:]
+	try:
+		# rindex excepts when there's no /
+		ind = string.rindex(path, '/')
+		parent_dir = path[:ind]
+        	filename = path[ind+1:]
+	except:
+		print("parse_path() exception")
+		ind = 0
+		parent_dir = ""
+        	filename = path
 	if len(parent_dir) == 0:
 		parent_dir = "/"
+	log_debug4("parse_path('%s') parent_dir: '%s', filename: '%s'" % (path, parent_dir, filename))
 	return parent_dir, filename
 
 
@@ -330,11 +337,11 @@ def imap_uid(imap, cmd, arg1, arg2 = None, arg3 = None, arg4 = None):
 		except Exception, e:
 			log_error("imap.uid() error: %s (tries left: %d)" % (str(e), tries))
 			if tries <= 0:
-				raise
+				abort()
 		except:
 			log_error("imap.uid() unknown error: (tries left: %d)" % (tries))
 			if tries <= 0:
-				raise
+				abort()
 		imap.fs.kick_imap(imap)
 	return ret
 
@@ -353,9 +360,9 @@ def __imap_append(imap, fsNameVar, flags, now, msg):
 				continue
 		except:
 			log_error("imap.append() exception: '%s' (tries left: %d)" % (sys.exc_info()[0], tries))
-			imap.fs.kick_imap(imap)
 			if tries <= 0:
-				raise
+				abort()
+			imap.fs.kick_imap(imap)
 	return rsp, data
 
 def imap_getquotaroot(imap, fsNameVar):
@@ -369,7 +376,7 @@ def imap_getquotaroot(imap, fsNameVar):
 			log_error("imap.getquotaroot() error: %s" % sys.exc_info()[0])
 			imap.fs.kick_imap(imap)
 			if tries <= 0:
-				raise
+				abort()
 	return ret
 
 # The IMAP uid commands can take multiple uids and return
@@ -1008,7 +1015,7 @@ class GmailInode(Dirtyable):
 		value = self.xattr[attr]
 		payload_name = 'xattr-'+attr
 		log_debug1("adding xattr payload named '%s': '%s'" % (payload_name, value))
-		msg_add_payload(msg, value, payload_name)
+		msg_add_payload(self.inode_msg, value, payload_name)
 	# remember where this is in case we have to delete it
 	i_orig_uid = self.inode_msg.uid
 	# because this wipes it out
@@ -1676,8 +1683,8 @@ class Gmailfs(Fuse):
             e = OSError("Not a link"+path)
             e.errno = EINVAL
             raise e
-        log_debug("about to follow link in body:"+inode.msg.as_string())
-	body = fixQuotedPrintable(inode.msg.as_string())
+        log_debug("about to follow link in body:"+inode.inode_msg.as_string())
+	body = fixQuotedPrintable(inode.inode_msg.as_string())
         m = re.search(SymlinkTag+'='+LinkStartDelim+'(.*)'+
                       LinkEndDelim,body)
         return m.group(1)
@@ -2064,6 +2071,7 @@ class Gmailfs(Fuse):
         inode = self.mk_inode(mode|S_IFDIR, 1, 2)
 	self.link_inode(path, inode)
 	parentdir, name = parse_path(path)
+	print("mkdir() parentdir: '%s' name: '%s'" % (parentdir, name))
         parentdirinode = self.lookup_inode(parentdir)
         parentdirinode.i_nlink += 1
         parentdirinode.mark_dirty("mkdir")
