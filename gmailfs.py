@@ -325,16 +325,17 @@ def imap_uid(imap, cmd, arg1, arg2 = None, arg3 = None, arg4 = None):
 		tries = tries - 1
 		try:
 		        ret = imap.uid(cmd, arg1, arg2, arg3)
+			if not ret == None:
+				return ret;
 		except Exception, e:
 			log_error("imap.uid() error: %s (tries left: %d)" % (str(e), tries))
-			imap.fs.kick_imap(imap)
 			if tries <= 0:
 				raise
 		except:
 			log_error("imap.uid() unknown error: (tries left: %d)" % (tries))
-			imap.fs.kick_imap(imap)
 			if tries <= 0:
 				raise
+		imap.fs.kick_imap(imap)
 	return ret
 
 def __imap_append(imap, fsNameVar, flags, now, msg):
@@ -352,6 +353,16 @@ def __imap_append(imap, fsNameVar, flags, now, msg):
 				continue
 		except RuntimeError, e:
 			log_error("imap.append() error: %s" % (str(e)))
+			imap.fs.kick_imap(imap)
+			if tries <= 0:
+				raise
+		except Exception, e:
+			log_error("imap.append() exception: %s" % (str(e)))
+			imap.fs.kick_imap(imap)
+			if tries <= 0:
+				raise
+		except:
+			log_error("imap.append() unknown error: (tries left: %d)" % (tries))
 			imap.fs.kick_imap(imap)
 			if tries <= 0:
 				raise
@@ -685,7 +696,7 @@ def _getMsguidsByQuery(about, imap, queries, or_query = 0):
     except:
 	log_error("IMAP error on SEARCH")
 	log_error("queryString: ->%s<-" % (queryString))
-	print "\nIMAP exception ", sys.exc_info()[0]
+	print "\nIMAP exception, exiting", sys.exc_info()[0]
     	exit(-1)
     finally:
         imap.lock.release()
@@ -925,9 +936,13 @@ class GmailDirent(Dirtyable):
 		to_trash.append(str(self.dirent_msg.uid))
 		if len(to_trash):
 			imap_trash_uids(self.fs.imap, to_trash)
+		semget(self.fs.lookup_lock)
 		deleted = self.fs.dirent_cache.pop(self.path())
 		if deleted != None and deleted != self:
-			log_error("removed wrong dirent from cache")
+			log_error("[%s] removed wrong dirent from cache self: %s" % (str(thread.get_ident()), str(self)))
+			log_error("\tmy path: '%s' uid: '%s' obj: %s" % (self.path(), str(self.dirent_msg.uid), str(self)))
+			log_error("\tdl path: '%s' uid: '%s' obj: %s" % (deleted.path(), str(deleted.dirent_msg.uid), str(deleted)))
+		self.fs.lookup_lock.release()
 
 
 #@-node:class GmailDirent
@@ -1396,21 +1411,33 @@ class GmailBlock(Dirtyable):
 class Gmailfs(Fuse):
 
     def kick_imap(self, imap):
+	print("kicking imap connection...")
+	print("disconnecting...")
+	self.disconnect_from_server(imap)
+	print("disonnected")
 	try:
-		self.disconnect_from_server(imap)
+		self.connect_to_server(imap)
+	except Exception, e:
+		print("kick connect exception: '%s'" % str(e))
 	except:
-		pass
-	self.connect_to_server(imap)
+		print("kick connect unknown exception")
 
     def disconnect_from_server(self, imap):
+	# these are just to be nice to the server.  It
+	# does not matter if they succeed because the
+	# init below will just blow everything away.
 	try:
 		imap.close()
-	except:
-		pass
-	try:
 		imap.logout()
+		imap.shutdown()
 	except:
-		pass
+		print("shutdown exception");
+	try:
+		imap.__init__("imap.gmail.com", 993)
+	except:
+		print("reconnect exception");
+
+	return
 
     #@	@+others
     def connect_to_server(self, imap = None):
@@ -1418,6 +1445,7 @@ class Gmailfs(Fuse):
         global password
         global username
 
+	print("connect_to_server()...")
 	fsNameVar = DefaultFsname
         password = DefaultPassword
         username = DefaultUsername
@@ -1439,6 +1467,7 @@ class Gmailfs(Fuse):
 		resp, data = imap.select(fsNameVar)
 		log_debug1("select2 '%s' resp: '%s' data: '%s'" % (fsNameVar, resp, data))
 		return
+	print("connect_to_server() done")
 	return imap
 
     def get_imap(self):
@@ -1451,7 +1480,7 @@ class Gmailfs(Fuse):
     def __init__(self, extraOpts, mountpoint, *args, **kw):
         Fuse.__init__(self, *args, **kw)
 
-    	self.nr_imap_threads = 4
+    	self.nr_imap_threads = 3
 	self.imap_pool = Queue.Queue(self.nr_imap_threads)
 	for i in range(self.nr_imap_threads):
 		self.imap_pool.put(self.connect_to_server())
@@ -1747,6 +1776,8 @@ class Gmailfs(Fuse):
         log_entry("unlink called on:"+path)
         try:
             dirent = self.lookup_dirent(path)
+	    if dirent == None:
+		return -EEXIST
             dirent.unlink()
             return 0
         except:
@@ -1999,11 +2030,11 @@ class Gmailfs(Fuse):
     #@-node:mknod
 
     def mk_dirent(self, inode, path):
+	# this should keep us from racing with lookup_dirent()
+	semget(self.lookup_lock)
 	if self.dirent_cache.has_key(path):
 		log_debug("dirent cache hit on path: '%s'" % (path))
 		return self.dirent_cache[path]
-	# this should keep us from racing with lookup_dirent()
-	semget(self.lookup_lock)
 	filename, dir = parse_path(path)
 	msg = self.mk_dirent_msg(path, inode.ino)
 	dirent = GmailDirent(msg, inode, self)
@@ -2386,7 +2417,10 @@ class Gmailfs(Fuse):
 			continue
 		new_dirent = GmailDirent(dirent_msg, inode, self)
 		log_debug2("cached dirent: '%s'" % (new_dirent.path()))
-	       	self.dirent_cache[new_dirent.path()] = new_dirent
+		if self.dirent_cache.has_key(new_dirent.path()):
+			new_dirent = self.dirent_cache[new_dirent.path()]
+		else:
+		       	self.dirent_cache[new_dirent.path()] = new_dirent
 		if new_dirent.path() == path:
 			log_debug2("lookup_dirent() dirent: '%s'" % (new_dirent.path()))
 			ret_dirent = new_dirent
