@@ -351,35 +351,25 @@ def __imap_append(imap, fsNameVar, flags, now, msg):
 				time.sleep(1)
 				rsp = None
 				continue
-		except RuntimeError, e:
-			log_error("imap.append() error: %s" % (str(e)))
-			imap.fs.kick_imap(imap)
-			if tries <= 0:
-				raise
-		except Exception, e:
-			log_error("imap.append() exception: %s" % (str(e)))
-			imap.fs.kick_imap(imap)
-			if tries <= 0:
-				raise
 		except:
-			log_error("imap.append() unknown error: (tries left: %d)" % (tries))
+			log_error("imap.append() exception: '%s' (tries left: %d)" % (sys.exc_info()[0], tries))
 			imap.fs.kick_imap(imap)
 			if tries <= 0:
 				raise
 	return rsp, data
 
 def imap_getquotaroot(imap, fsNameVar):
-	tries = 2
+	tries = 3
 	ret = None
 	while ret == None:
+		tries = tries - 1
 		try:
 		        ret = imap.getquotaroot(fsNameVar)
-		except RuntimeError, e:
-			log_error("imap.getquotaroot() error: %s" % (str(e)))
+		except:
+			log_error("imap.getquotaroot() error: %s" % sys.exc_info()[0])
 			imap.fs.kick_imap(imap)
 			if tries <= 0:
 				raise
-		tries = tries - 1
 	return ret
 
 # The IMAP uid commands can take multiple uids and return
