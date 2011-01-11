@@ -554,11 +554,10 @@ class testthread(Thread):
 		self.nr = nr
 
 	def write_out_object(self):
-		try:
-			# block, and timeout after 1 second
-			object = self.fs.dirty_objects.get(1, 1)
-		except:
-			# effectively success if we timeout
+		object = self.fs.get_dirty_object()
+		if object == None:
+			# the queues are empty, so all is good
+			time.sleep(1)
 			return 0
 		# we do not want to sit here sleeping on objects
 		# so if we can not get the lock, move on to another
@@ -868,36 +867,16 @@ class Dirtyable(object):
 		log_info("cleared original dirty reason: '%s'" % (orig_reason))
 		return msg
 
-	# I was getting things blocked on addition to the dirty list.  I thought
-	# the writeout threads had died.  But, I put this in and miraculously it
-	# started to work ok.  There might be a bug in the blocking Queue.put()
-	# that causes it to hang when it shouldn't.  This may work around it.
-	def put_on_global_list(self):
-		tries = 0
-		should_block = 1
-		timeout = 10
-		success = 0
-
-		while success == 0:
-			try:
-				self.fs.dirty_objects.put(self, should_block, timeout)
-				success = 1
-			except Queue.Full:
-				tries = tries + 1
-				print("[%d] hung on dirty (%d long) list for %d seconds" %
-					(thread.get_ident(), self.fs.dirty_objects.qsize(), tries*timeout))
-				traceback.print_stack()
-
-	def mark_dirty(self, desc):
+	def mark_dirty(self, desc, can_block = 1):
 		self.__dirty = desc
 		self.dirty_reasons.put(desc)
 		try:
 			self.dirty_mark.put_nowait(desc)
-			self.put_on_global_list()
+			self.fs.queue_dirty(self, can_block)
 		except:
 			log_debug("mark_dirty('%s') skipped global list, already dirty" % (self.to_str()))
-		log_debug1("mark_dirty('%s') because '%s' (%d reasons)" %
-				(self.to_str(), desc, self.dirty_reasons.qsize()))
+		log_debug1("mark_dirty('%s') because '%s' (%d reasons, %d total)" %
+				(self.to_str(), desc, self.dirty_reasons.qsize(), self.fs.nr_dirty_objects()))
 
 	def to_str(self):
 		return "Dirtyable.to_str()"
@@ -1024,10 +1003,10 @@ class GmailInode(Dirtyable):
     def to_str(self):
 	    return "inode(%s)" % (str(self.ino))
 
-    def mark_dirty(self, desc):
+    def mark_dirty(self, desc, can_block = 1):
 	log_debug2("inode mark_dirty(%s) size: '%s'" % (desc, str(self.size)))
         self.mtime = int(time.time())
-	Dirtyable.mark_dirty(self, desc)
+	Dirtyable.mark_dirty(self, desc, can_block)
 
     def i_write_out(self, desc):
 	log_debug2("i_write_out() self: '%s'" % (self))
@@ -1361,7 +1340,12 @@ class GmailBlock(Dirtyable):
 	log_debug("b_write_out() finished, rsp: '%s'" % str(msgid))
 	if msgid > 0:
             log_debug("Sent write commit ok")
-            self.inode.mark_dirty("commit data block")
+	    # This is a special case.  This b_write_out() happens in a worker thread,
+	    # and if we block it waiting on dirty data to be written out, we may end
+	    # up deadlocking.  So, put the inode on a dirty list, but do not block
+	    # doing it.
+	    can_block = 0
+            self.inode.mark_dirty("commit data block", can_block)
 	    tmpf.close()
             ret = 0
         else:
@@ -1507,6 +1491,70 @@ class Gmailfs(Fuse):
     def put_imap(self, imap):
 	self.imap_pool.put(imap)
 
+    def drain_nonblocking_dirty_queue(self):
+	src = self.dirty_objects_nonblocking
+	while not src.empty():
+		try:
+			o = src.get_nowait()
+		except Queue.Empty:
+			return
+		self.queue_dirty_blockable(o)
+
+    # I was getting things blocked on addition to the dirty list.  I thought
+    # the writeout threads had died.  But, I put this in and miraculously it
+    # started to work ok.  There might be a bug in the blocking Queue.put()
+    # that causes it to hang when it shouldn't.  This may work around it.
+    def queue_dirty_blockable(self, obj):
+	tries = 0
+	timeout = 10
+	success = 0
+	can_block = 1
+
+	while success == 0:
+		try:
+			self.dirty_objects.put(obj, can_block, timeout)
+			success = 1
+		except Queue.Full:
+			tries = tries + 1
+			print("[%d] hung on dirty (%d long) list for %d seconds" %
+				(thread.get_ident(), self.dirty_objects.qsize(), tries*timeout))
+			traceback.print_stack()
+
+    def queue_dirty(self, obj, can_block = 1):
+	if can_block:
+		# take the opportunity to move the non-blocking queue
+		# over to the blocking one.  The more often you do this
+		# the less chance there is for the queue to get too
+		# large
+		self.drain_nonblocking_dirty_queue()
+		self.queue_dirty_blockable(obj)
+	else:
+		# this one is non-blocking on put()s because it has no
+		# size limit
+		self.dirty_objects_nonblocking.put(obj)
+	print "end queue_dirty(%s, %d) queue size now: %d/%d" % (obj, can_block, self.nr_dirty_objects.qsize(), self.dirty_objects_nonblocking.qsize())
+
+
+    def nr_dirty_objects(self):
+	size = self.dirty_objects.qsize() + self.dirty_objects_nonblocking.qsize()
+	return size
+
+    def get_dirty_object(self):
+	try:
+		obj = self.dirty_objects.get_nowait()
+		log_debug3("get_dirty_object() found one in normal queue: '%s'" % (obj))
+		return obj
+	except Queue.Empty:
+		pass
+	try:
+		obj = self.dirty_objects_nonblocking.get_nowait()
+		log_debug3("get_dirty_object() found one in nonblock queue: '%s'" % (obj))
+		return obj
+	except Queue.Empty:
+		pass
+	log_debug3("get_dirty_object() found nothing")
+	return None
+
     #@+node:__init__
     def __init__(self, extraOpts, mountpoint, *args, **kw):
         Fuse.__init__(self, *args, **kw)
@@ -1517,11 +1565,14 @@ class Gmailfs(Fuse):
 		exit(0)
 
     	self.nr_imap_threads = 3
+	if "IMAPFS_NR_THREADS" in os.environ:
+		self.nr_imap_threads = os.environ['IMAPFS_NR_THREADS']
 	self.imap_pool = Queue.Queue(self.nr_imap_threads)
 	for i in range(self.nr_imap_threads):
 		self.imap_pool.put(self.connect_to_server())
 
 	self.dirty_objects = Queue.Queue(50)
+	self.dirty_objects_nonblocking = Queue.Queue()
 	self.lookup_lock = threading.Semaphore(1)
         self.inode_cache_lock = threading.Semaphore(1)
 
@@ -1913,16 +1964,13 @@ class Gmailfs(Fuse):
 		    self.put_inode(dirent.inode)
 
 	    while 1:
-		try:
-			# no args means do not block, and trow
-			# exception immediately if empty
-			object = self.fs.dirty_objects.get()
-			write_out(object, "flush_dirent_cache()")
-			log_info("flush_dirent_cache() wrote out %s" % (object.to_str()))
-		except:
+		object = self.get_dirty_object()
+		if object == None:
 			log_info("no more object to flush")
 			break
-		size = self.fs.dirty_objects.qsize()
+		write_out(object, "flush_dirent_cache()")
+		log_info("flush_dirent_cache() wrote out %s" % (object.to_str()))
+		size = self.fs.nr_dirty_objects()
 	    log_info("explicit flush done")
 
     #@+node:unlink
@@ -2237,7 +2285,7 @@ class Gmailfs(Fuse):
         inode = self.mk_inode(mode|S_IFDIR, 1, 2)
 	self.link_inode(path, inode)
 	parentdir, name = parse_path(path)
-	print("mkdir() parentdir: '%s' name: '%s'" % (parentdir, name))
+	log_debug1("mkdir() parentdir: '%s' name: '%s'" % (parentdir, name))
         parentdirinode = self.lookup_inode(parentdir)
         parentdirinode.i_nlink += 1
         parentdirinode.mark_dirty("mkdir")
