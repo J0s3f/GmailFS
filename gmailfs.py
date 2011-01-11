@@ -1344,7 +1344,7 @@ class GmailBlock(Dirtyable):
 	self.buffer_lock.release()
 	if self.inode.size / self.block_size == self.block_nr:
 		part = self.inode.size % self.block_size
-		print("on last block, so only writing out %d/%d bytes of block" % (part, len(buf)))
+		log_debug2("on last block, so only writing out %d/%d bytes of block" % (part, len(buf)))
 		buf = buf[:part]
 
         arr = array.array('c')
