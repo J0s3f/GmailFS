@@ -161,6 +161,8 @@ rsp_cache_misses = 0
 rsp_cache = {}
 
 debug = 1
+if "DEBUG" in os.environ:
+	debug = int(os.environ['DEBUG'])
 if debug >= 3:
 	imaplib.Debug = 3
 #imaplib.Debug = 4
@@ -563,14 +565,17 @@ class testthread(Thread):
 		# so if we can not get the lock, move on to another
 		# object
 		got_lock = object.writeout_lock.acquire(0)
+		log_debug3("write out got_lock: '%s' obj dirty: %s" % (str(got_lock), str(object.dirty())))
 		if not got_lock:
-			self.fs.dirty_objects.put(object)
+			dont_block = 1
+			self.fs.queue_dirty(object, dont_block)
 			return -1
 		sem_msg[object.writeout_lock] = "acquired write_out_object()"
 		reason = Dirtyable.dirty_reason(object)
     		start = time.time()
 		ret = write_out_nolock(object, "bdflushd")
     		end = time.time()
+		log_debug3("write out about to releaselock")
 		object.writeout_lock.release()
 		sem_msg[object.writeout_lock] += " released write_out_object()"
 		size = self.fs.dirty_objects.qsize()
@@ -788,14 +793,14 @@ def getSingleMessageByQuery(desc, imap, q):
 	return fetch_full_message(imap, msgid)
 
 def _pathSeparatorEncode(path):
-    s1 = re.sub("/","__fs__",path)
-    s2 = re.sub("-","__mi__",s1)
-    return re.sub("\+","__pl__",s2)
+    #s1 = re.sub("/","__fs__",path)
+    #s2 = re.sub("-","__mi__",s1)
+    return re.sub("\+","__pl__",path)
 
 def _pathSeparatorDecode(path):
-    s1 = re.sub("__fs__","/",path)
-    s2 = re.sub("__mi__","-",s1)
-    return re.sub("__pl__","+",s2)
+    #s1 = re.sub("__fs__","/",path)
+    #s2 = re.sub("__mi__","-",s1)
+    return re.sub("__pl__","+",path)
 
 
 def _logException(msg):
@@ -918,7 +923,7 @@ class GmailDirent(Dirtyable):
        		    raise e
 		return 0
 
-	def unlink(self):
+	def d_unlink(self):
 		# FIXME, don't allow directory unlinking when children
 		log_debug1("unlink path:"+self.path()+" with nlinks:"+str(self.inode.i_nlink))
 		if self.inode.mode & S_IFDIR:
@@ -932,8 +937,15 @@ class GmailDirent(Dirtyable):
 		to_trash = self.inode.dec_nlink()
 		to_trash.append(str(self.dirent_msg.uid))
 		if len(to_trash):
+			for uid in to_trash:
+				log_debug1("unlink() going to trash uid: %s" % (uid))
 			imap_trash_uids(self.fs.imap, to_trash)
 		semget(self.fs.lookup_lock)
+		# this ensures that the (now dead) dentry will never get written out
+		while (self.dirty() > 0):
+			dirty_token = self.dirty()
+			print "d_unlink() dirty token: '%s'" % (dirty_token)
+			self.clear_dirty(dirty_token)
 		deleted = self.fs.dirent_cache.pop(self.path())
 		if deleted != None and deleted != self:
 			log_error("[%s] removed wrong dirent from cache self: %s" % (str(thread.get_ident()), str(self)))
@@ -1016,6 +1028,7 @@ class GmailInode(Dirtyable):
 		payload_name = 'xattr-'+attr
 		log_debug1("adding xattr payload named '%s': '%s'" % (payload_name, value))
 		msg_add_payload(self.inode_msg, value, payload_name)
+        log_debug3("i_write_out() self.dirty: '%s' desc: '%s'" % (Dirtyable.dirty_reason(self), desc))
 	# remember where this is in case we have to delete it
 	i_orig_uid = self.inode_msg.uid
 	# because this wipes it out
@@ -1088,10 +1101,18 @@ class GmailInode(Dirtyable):
 		return []
 	log_debug2("truncating inode")
 	subject = 'b='+str(self.ino)+''
+	# either wait until it is fully written out
+	got_lock = self.writeout_lock.acquire()
+	# or make sure that it never is
+	while (self.dirty() > 0):
+		dirty_token = self.dirty()
+		self.clear_dirty(dirty_token)
+
 	block_uids = _getMsguidsByQuery("unlink blocks", self.fs.imap, [subject])
 	to_trash = []
 	to_trash.extend(block_uids)
 	to_trash.append(str(self.inode_msg.uid))
+	self.writeout_lock.release()
 	return to_trash
 
     def fill_from_inode_msg(self):
@@ -1418,7 +1439,9 @@ class Gmailfs(Fuse):
 	self.disconnect_from_server(imap)
 	print("disonnected")
 	try:
+		sys.stderr.write("connecting to server..." % (i))
 		self.connect_to_server(imap)
+		sys.stderr.write("done\n")
 	except Exception, e:
 		print("kick connect exception: '%s'" % str(e))
 	except:
@@ -1447,7 +1470,6 @@ class Gmailfs(Fuse):
         global password
         global username
 
-	print("connect_to_server()...")
 	fsNameVar = DefaultFsname
         password = DefaultPassword
         username = DefaultUsername
@@ -1469,7 +1491,6 @@ class Gmailfs(Fuse):
 		resp, data = imap.select(fsNameVar)
 		log_debug1("select2 '%s' resp: '%s' data: '%s'" % (fsNameVar, resp, data))
 		return
-	print("connect_to_server() done")
 	return imap
 
     def get_imap(self):
@@ -1532,7 +1553,8 @@ class Gmailfs(Fuse):
 		# this one is non-blocking on put()s because it has no
 		# size limit
 		self.dirty_objects_nonblocking.put(obj)
-	print "end queue_dirty(%s, %d) queue size now: %d/%d" % (obj, can_block, self.nr_dirty_objects.qsize(), self.dirty_objects_nonblocking.qsize())
+	log_debug3("end queue_dirty(%s, %d) queue size now: %d/%d" %
+			(obj, can_block, self.dirty_objects.qsize(), self.dirty_objects_nonblocking.qsize()))
 
 
     def nr_dirty_objects(self):
@@ -1569,7 +1591,9 @@ class Gmailfs(Fuse):
 		self.nr_imap_threads = os.environ['IMAPFS_NR_THREADS']
 	self.imap_pool = Queue.Queue(self.nr_imap_threads)
 	for i in range(self.nr_imap_threads):
+		sys.stderr.write("connecting thread %d to server..." % (i))
 		self.imap_pool.put(self.connect_to_server())
+		sys.stderr.write("done\n")
 
 	self.dirty_objects = Queue.Queue(50)
 	self.dirty_objects_nonblocking = Queue.Queue()
@@ -1672,6 +1696,23 @@ class Gmailfs(Fuse):
 	#exit(0)
 	#elf.mythread()
 
+	log_debug1("init looking for root inode")
+	path = "/"
+        inode = self.lookup_inode(path)
+        if (inode == None) and (path == '/'):
+		log_info("creating root inode")
+		mode = S_IFDIR|S_IRUSR|S_IXUSR|S_IWUSR|S_IRGRP|S_IXGRP|S_IXOTH|S_IROTH
+        	inode = self.mk_inode(mode, 1)
+		inode.i_nlink = inode.i_nlink + 1
+		dirent = self.link_inode(path, inode)
+		write_out(inode, "new root inode")
+		write_out(dirent, "new root dirent")
+		log_info("root inode uids: %s %s" % (dirent.dirent_msg.uid, inode.inode_msg.uid))
+        	inode = self.lookup_inode(path)
+		if inode == None:
+			log_info("uh oh, can't find root inode")
+			exit(-1)
+
         pass
     #@-node:__init__
 
@@ -1706,7 +1747,9 @@ class Gmailfs(Fuse):
 		#subject = msg['Subject']
 		print "inode_uid: '%s'" % (uid)
 
-	all_dirs = {};
+	dir_members = {};
+	path_to_dirent = {};
+	print "fetching dirent msgs..."
 	for msgid, msg in fetch_full_messages(self.imap, dirent_uids).items():
 		dirent_parts = self.parse_dirent_msg(msg)
 		pathname = _pathSeparatorDecode(dirent_parts[PathNameTag])
@@ -1715,47 +1758,53 @@ class Gmailfs(Fuse):
 		dirent_parts['msg'] = msg
 
 		filename = dirent_parts[FileNameTag]
-		if not all_dirs.has_key(pathname):
-			all_dirs[pathname] = {}
-		directory = all_dirs[pathname]
+		if not dir_members.has_key(pathname):
+			dir_members[pathname] = {}
+		directory = dir_members[pathname]
 		if directory.has_key(filename):
 			existing = directory[filename]
 			print "ERROR: '%s' occurs twice in dir: '%s'" % (filename, pathname)
 			if existing['msg'].uid > msgid:
 				# throw away the current message that
 				# we're looking at
-				imap_trash_msg(self.imap, msg)
+				##imap_trash_msg(self.imap, msg)
 				# and forget that we ever saw it
 				continue
 			else:
 				# throw away the message that was there
-				imap_trash_msg(self.imap, existing['msg'])
+				##imap_trash_msg(self.imap, existing['msg'])
 				# not stricly necessary, but clearer
 				directory.pop(filename)
 		directory[filename] = dirent_parts
 		# are these copy by value or reference??!?!?
-		all_dirs[pathname] = directory
-		print "[%s] set '%s': '%s'" % (str(msgid), pathname, filename)
+		dir_members[pathname] = directory
+		print "[%s] found in path '%s': file: '%s'" % (str(msgid), pathname, filename)
+		# the if is to handle "/"
+		if len(filename) > 0:
+			full = dirent_parts['pathname'] + filename
+		else:
+			full = "/"
+		path_to_dirent[full] = dirent_parts
 
 	inode_refcount = {}
-	for dirname, dirents in all_dirs.iteritems():
-		for fname, dirent in dirents.iteritems():
-			full = dirent['pathname'] + "/" + fname
-			grandparent_path, parent_name = parse_path(dirent['pathname'])
-			print "grandparent: '%s' parent: '%s' f: '%s'" % (grandparent_path, parent_name, fname)
-			if not all_dirs.has_key(grandparent_path):
-				print "ERROR: could not find grandparent dir '%s' for '%s'" % (grandparent_path, full)
-				imap_trash_msg(self.imap, dirent['msg'])
-				continue
-			grandparent = all_dirs[grandparent_path]
-			if not grandparent.has_key(parent_name):
-				print "ERROR: could not find parent entry '%s' in dir '%s'" % (parent_name, grandparent_path)
-				imap_trash_msg(self.imap, dirent['msg'])
-				continue
-			ino = dirent[RefInodeTag]
-			if not inode_refcount.has_key(ino):
-				inode_refcount[ino] = 0
+	for full, dirent in path_to_dirent.iteritems():
+		ino = dirent[RefInodeTag]
+		if not inode_refcount.has_key(ino):
+			inode_refcount[ino] = 0
+		inode_refcount[ino] = inode_refcount[ino] + 1
+		# Is it a directory?
+		if dir_members.has_key(full):
 			inode_refcount[ino] = inode_refcount[ino] + 1
+
+		parent_path = dirent['pathname']
+		print "process parent: '%s' for '%s'" % (parent_path, full)
+		if not len(parent_path):
+			print "WARNING: zero-length parent: '%s' for '%s' hope it's /)" % (parent_path, full)
+			continue
+		if not path_to_dirent.has_key(parent_path):
+			print "ERROR: could not find parent entry '%s'" % (parent_path)
+			##imap_trash_msg(self.imap, dirent['msg'])
+			continue
 
 	inodes_seen = {}
 	print "fetching all inodes..."
@@ -1763,10 +1812,11 @@ class Gmailfs(Fuse):
 		inode_parts = self.parse_inode_msg_subj(msg)
 		ino = inode_parts[InodeTag]
 
+		log_debug2("msgid: %s has ino: %s" % (msgid, ino))
 		if not inode_refcount.has_key(ino):
 			# FIXME: link into lost+found dir
 			print "ERROR: unlinked inode: '%s'" % (ino)
-			imap_trash_msg(self.imap, msg)
+			##imap_trash_msg(self.imap, msg)
 			continue
 		if inodes_seen.has_key(ino):
 			existing = inodes_seen[ino]
@@ -1774,12 +1824,12 @@ class Gmailfs(Fuse):
 			if existing['msg'].uid > msgid:
 				# throw away the current message that
 				# we're looking at
-				imap_trash_msg(self.imap, msg)
+				##imap_trash_msg(self.imap, msg)
 				# and forget that we ever saw it
 				continue
 			else:
 				# throw away the message that was there
-				imap_trash_msg(self.imap, existing['msg'])
+				##imap_trash_msg(self.imap, existing['msg'])
 				# not stricly necessary, but clearer
 				inodes_seen.pop(ino)
 		inode_parts['msg'] = msg
@@ -1828,23 +1878,7 @@ class Gmailfs(Fuse):
         #st_mtime (time of most recent content modification)
         #st_ctime (time of most recent content modification or metadata change).
 
-	log_debug3("getattr() -1")
         inode = self.lookup_inode(path)
-	log_debug3("getattr() 0")
-        if (inode == None) and (path == '/'):
-		log_info("creating root inode")
-		mode = S_IFDIR|S_IRUSR|S_IXUSR|S_IWUSR|S_IRGRP|S_IXGRP|S_IXOTH|S_IROTH
-        	inode = self.mk_inode(mode, 1, 2)
-		dirent = self.link_inode(path, inode)
-		write_out(inode, "new root inode")
-		write_out(dirent, "new root dirent")
-		log_info("root inode uids: %s %s" % (dirent.dirent_msg.uid, inode.inode_msg.uid))
-        	inode = self.lookup_inode(path)
-		if inode == None:
-			log_info("uh oh, can't find root inode")
-			exit(-1)
-	log_debug3("getattr() 1")
-
         if inode:
 	    log_debug3("getattr() 2")
 	    log_debug3("found inode for path: '%s'" % (path))
@@ -1970,7 +2004,7 @@ class Gmailfs(Fuse):
 			break
 		write_out(object, "flush_dirent_cache()")
 		log_info("flush_dirent_cache() wrote out %s" % (object.to_str()))
-		size = self.fs.nr_dirty_objects()
+		size = self.nr_dirty_objects()
 	    log_info("explicit flush done")
 
     #@+node:unlink
@@ -1980,7 +2014,7 @@ class Gmailfs(Fuse):
             dirent = self.lookup_dirent(path)
 	    if dirent == None:
 		return -EEXIST
-            dirent.unlink()
+            dirent.d_unlink()
             return 0
         except:
             _logException("Error unlinking file"+path)
@@ -1999,7 +2033,7 @@ class Gmailfs(Fuse):
         #    e.errno = ENOTEMPTY
         #    raise e
         dirent = self.lookup_dirent(path)
-        dirent.unlink()
+        dirent.d_unlink()
 
         # update number of links in parent directory
 	parentdir, filename = parse_path(path)
@@ -2015,7 +2049,7 @@ class Gmailfs(Fuse):
     def symlink(self, oldpath, newpath):
         log_debug1("symlink: oldpath='%s', newpath='%s'" % (oldpath, newpath))
 	mode = S_IFLNK|S_IRWXU|S_IRWXG|S_IRWXO
-	inode = self.mk_inode(mode, 0, 1)
+	inode = self.mk_inode(mode, 0)
 	inode.symlink_tgt = newpath
 	self.link_inode(oldpath, inode)
 
@@ -2112,13 +2146,13 @@ class Gmailfs(Fuse):
 
 	dst_dirent = self.lookup_dirent(path_dst)
 	if not dst_dirent == None:
-		dst_dirent.unlink()
+		dst_dirent.d_unlink()
 	# ensure the inode does not go away between
 	# when we unlink and relink it
 	inode = self.get_inode(src_dirent.inode.ino)
 	# do the unlink first, because otherwise we
 	# will get two dirents at the same path
-	src_dirent.unlink()
+	src_dirent.d_unlink()
 	self.link_inode(path_dst, inode)
 	self.put_inode(inode)
 
@@ -2225,7 +2259,7 @@ class Gmailfs(Fuse):
     	""" Python has no os.mknod, so we can only do some things """
         log_entry("mknod('%s')" % (path))
 	if S_ISREG(mode) | S_ISFIFO(mode) | S_ISSOCK(mode):
-	    inode = self.mk_inode(mode, 0, 1)
+	    inode = self.mk_inode(mode, 0)
 	    self.link_inode(path, inode)
 	    # update parent dir??
     	    #open(path, "w")
@@ -2255,11 +2289,11 @@ class Gmailfs(Fuse):
 	log_debug1("mk_dirent('%s') lock released" % path)
 	return dirent
 
-    def mk_inode(self, mode, size, nlink=1):
+    def mk_inode(self, mode, size):
 	inode = GmailInode(None, self)
 	inode.mode = int(mode)
 	inode.size = int(size)
-	inode.i_nlink = int(nlink)
+	inode.i_nlink = 0
 	inode.mark_dirty("new inode")
 	self.inode_cache[inode.ino] = inode
 	return inode
@@ -2282,7 +2316,9 @@ class Gmailfs(Fuse):
         log_entry("mkdir('%s', %o)" % (path, mode))
 	if (self.lookup_dirent(path) != None):
 		return -EEXIST
-        inode = self.mk_inode(mode|S_IFDIR, 1, 2)
+        inode = self.mk_inode(mode|S_IFDIR, 1)
+	# extra link for for '.'
+	inode.i_nlink = inode.i_nlink + 1
 	self.link_inode(path, inode)
 	parentdir, name = parse_path(path)
 	log_debug1("mkdir() parentdir: '%s' name: '%s'" % (parentdir, name))
