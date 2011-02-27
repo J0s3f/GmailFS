@@ -1703,7 +1703,10 @@ class Gmailfs(Fuse):
 		log_info("creating root inode")
 		mode = S_IFDIR|S_IRUSR|S_IXUSR|S_IWUSR|S_IRGRP|S_IXGRP|S_IXOTH|S_IROTH
         	inode = self.mk_inode(mode, 1)
-		inode.i_nlink = inode.i_nlink + 1
+		# "/" is special and gets an extra link.
+		# It will always appear to have an nlink of 3
+		# even when it is empty
+		inode.i_nlink = inode.i_nlink + 2
 		dirent = self.link_inode(path, inode)
 		write_out(inode, "new root inode")
 		write_out(dirent, "new root dirent")
@@ -1779,9 +1782,13 @@ class Gmailfs(Fuse):
 		# are these copy by value or reference??!?!?
 		dir_members[pathname] = directory
 		print "[%s] found in path '%s': file: '%s'" % (str(msgid), pathname, filename)
-		# the if is to handle "/"
+		# the "/" dirent has a path of '/' and a filename: ''
 		if len(filename) > 0:
-			full = dirent_parts['pathname'] + filename
+			# the path of things under the root dir already end in /
+			if len(dirent_parts['pathname']) > 1:
+				full = dirent_parts['pathname'] + "/" + filename
+			else:
+				full = dirent_parts['pathname'] + filename
 		else:
 			full = "/"
 		path_to_dirent[full] = dirent_parts
@@ -1790,14 +1797,14 @@ class Gmailfs(Fuse):
 	for full, dirent in path_to_dirent.iteritems():
 		ino = dirent[RefInodeTag]
 		if not inode_refcount.has_key(ino):
-			inode_refcount[ino] = 0
-		inode_refcount[ino] = inode_refcount[ino] + 1
-		# Is it a directory?
-		if dir_members.has_key(full):
+			print "creating refcount for '%s'" % (full)
+			inode_refcount[ino] = 1
+		else:
 			inode_refcount[ino] = inode_refcount[ino] + 1
+			print " bumping refcount for '%s' to : %d" % (full, inode_refcount[ino])
 
 		parent_path = dirent['pathname']
-		print "process parent: '%s' for '%s'" % (parent_path, full)
+		#print "process parent: '%s' for '%s'" % (parent_path, full)
 		if not len(parent_path):
 			print "WARNING: zero-length parent: '%s' for '%s' hope it's /)" % (parent_path, full)
 			continue
@@ -1806,11 +1813,35 @@ class Gmailfs(Fuse):
 			##imap_trash_msg(self.imap, dirent['msg'])
 			continue
 
+	print "second dirent pass, bumping refcounts for parent directories..."
+	for full, dirent in path_to_dirent.iteritems():
+		parent_path = dirent['pathname']
+		parent_dirent = path_to_dirent[parent_path]
+		parent_ino = parent_dirent[RefInodeTag]
+		if full == "/":
+			print "skipping refcount bump for '/', it has enough"
+			continue
+		if not inode_refcount.has_key(parent_ino):
+			print "WARNING: parent: '%s' not seen until second dirent pass" % (parent_path)
+			inode_refcount[parent_ino] = 0
+		inode_refcount[parent_ino] = inode_refcount[parent_ino] + 1
+		print "bumping refcount for parent dir of '%s': '%s' to: %d" \
+				% (full, parent_path, inode_refcount[parent_ino])
+
+
 	inodes_seen = {}
 	print "fetching all inodes..."
 	for msgid, msg in fetch_full_messages(self.imap, inode_uids).items():
+
 		inode_parts = self.parse_inode_msg_subj(msg)
 		ino = inode_parts[InodeTag]
+
+		inode_obj = GmailInode(msg, self)
+		mode = inode_obj.mode
+		if inode_obj.mode & S_IFDIR:
+			inode_refcount[ino] = inode_refcount[ino] + 1
+			print "bumped refcount for dir ino: %d to : %d" % (ino, inode_refcount[ino])
+		inode_obj = None
 
 		log_debug2("msgid: %s has ino: %s" % (msgid, ino))
 		if not inode_refcount.has_key(ino):
@@ -2506,6 +2537,13 @@ class Gmailfs(Fuse):
         dirent = self.lookup_dirent(path)
 	#write_out(dirent, "flush")
 	#write_out(dirent.inode, "flush")
+	while self.nr_dirty_objects() > 0:
+		print "there are still dirty objects, sleeping..."
+		time.sleep(1)
+	#print "sleeping before fsck"
+	#time.sleep(5)
+	#print "now fscking"
+	#self.fsck()
         return 0
     #@-node:fsync
 
