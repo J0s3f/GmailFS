@@ -122,6 +122,9 @@ UserConfigFile = abspath(expanduser("~/.gmailfs.conf"))
 GMAILFS_VERSION = '5'
 PATHNAME_MAX = 256
 
+DELETE_AFTER_READ = 1
+KEEP_AFTER_READ = 0
+
 PathStartDelim  = '__a__'
 PathEndDelim    = '__b__'
 FileStartDelim  = '__c__'
@@ -1255,7 +1258,7 @@ class GmailBlock(Dirtyable):
         self.start_offset = self.block_nr * self.block_size
         self.end_offset = self.start_offset + self.block_size
 	self.ts = time.time()
-	log_debug1("created new block: %d" % (self.block_nr))
+	log_debug1("created new GmailBlock: %d for inode: %d" % (self.block_nr, inode.ino))
 	gmail_blocks[self] = self
 
     def to_str(self):
@@ -1298,7 +1301,7 @@ class GmailBlock(Dirtyable):
 	    self.buffer = list(" "*self.block_size)
 	    self.buffer_lock.release()
         else:
-	    self.populate_buffer(1)
+	    self.populate_buffer(DELETE_AFTER_READ)
 
 	buf_write_start = file_off - self.start_offset
 	buf_write_end = buf_write_start + len(buf_part)
@@ -1318,7 +1321,7 @@ class GmailBlock(Dirtyable):
 	self.buffer_lock.release()
 	log_debug1("wrote block range: [%d:%d]" % (buf_write_start, buf_write_end))
 
-	log_debug1("block write() setting dirty")
+	log_debug1("block write() setting GmailBlock dirty")
 	self.mark_dirty("file write")
 
         if file_off + len(buf_part) > self.inode.size:
@@ -1379,7 +1382,7 @@ class GmailBlock(Dirtyable):
         readlen = min(self.inode.size - file_off, readlen)
 	log_debug1("read block: %d" % (self.block_nr))
 
-        self.populate_buffer(1)
+	self.populate_buffer(KEEP_AFTER_READ)
 	start_offset = max(file_off, self.start_offset)
 	end_offset   = min(file_off + readlen, self.end_offset)
 	start_offset -= self.start_offset
@@ -1403,7 +1406,7 @@ class GmailBlock(Dirtyable):
 	q2 = 'x='+str(self.block_nr)
         msg = getSingleMessageByQuery("block read", self.inode.fs.imap, [ q1, q2 ])
 	if msg == None:
-	    log_debug2("readFromGmail(): file has no blocks, returning empty contents (%s %s)" % (q1, q2))
+	    log_debug1("readFromGmail(): file has no blocks, returning empty contents (%s %s)" % (q1, q2))
 	    self.buffer = list(" "*self.block_size)
 	    self.buffer_lock.release()
 	    return
@@ -1420,7 +1423,8 @@ class GmailBlock(Dirtyable):
 	log_debug3("after loop, a: '%s'" % str(a))
 	a = list(a)
 
-        if deleteAfter:
+        if deleteAfter == DELETE_AFTER_READ:
+ 	    log_debug1("populate_buffer() deleting msg: '%s'" % (msg.uid));
             imap_trash_msg(self.inode.fs.imap, msg)
         contentList = list(" "*self.block_size)
         contentList[0:] = a
@@ -1439,7 +1443,7 @@ class Gmailfs(Fuse):
 	self.disconnect_from_server(imap)
 	print("disonnected")
 	try:
-		sys.stderr.write("connecting to server..." % (i))
+		sys.stderr.write("connecting to server...")
 		self.connect_to_server(imap)
 		sys.stderr.write("done\n")
 	except Exception, e:
@@ -1494,6 +1498,8 @@ class Gmailfs(Fuse):
 	return imap
 
     def get_imap(self):
+	if self.early:
+		return self.imap
 	imap = None
 	timeout = 1
 	block = 1
@@ -1510,6 +1516,8 @@ class Gmailfs(Fuse):
 	return imap
 
     def put_imap(self, imap):
+	if self.early:
+		return
 	self.imap_pool.put(imap)
 
     def drain_nonblocking_dirty_queue(self):
@@ -1580,11 +1588,17 @@ class Gmailfs(Fuse):
     #@+node:__init__
     def __init__(self, extraOpts, mountpoint, *args, **kw):
         Fuse.__init__(self, *args, **kw)
+	self.dirty_objects = Queue.Queue(50)
+	self.dirty_objects_nonblocking = Queue.Queue()
+	self.lookup_lock = threading.Semaphore(1)
+        self.inode_cache_lock = threading.Semaphore(1)
 
 	self.imap = self.connect_to_server()
+	self.early = 1;
 	if "IMAPFS_FSCK" in os.environ:
 		self.fsck()
 		exit(0)
+	self.early = 0;
 
     	self.nr_imap_threads = 3
 	if "IMAPFS_NR_THREADS" in os.environ:
@@ -1594,11 +1608,6 @@ class Gmailfs(Fuse):
 		sys.stderr.write("connecting thread %d to server..." % (i))
 		self.imap_pool.put(self.connect_to_server())
 		sys.stderr.write("done\n")
-
-	self.dirty_objects = Queue.Queue(50)
-	self.dirty_objects_nonblocking = Queue.Queue()
-	self.lookup_lock = threading.Semaphore(1)
-        self.inode_cache_lock = threading.Semaphore(1)
 
         self.fuse_args.mountpoint = mountpoint
 	self.fuse_args.setmod('foreground')
@@ -1722,6 +1731,11 @@ class Gmailfs(Fuse):
     #@+node:attribs
     flags = 1
 
+    def fsck_trash_msg(self, msg):
+	if not "IMAPFS_FSCK_CAN_WRITE" in os.environ:
+		return
+	imap_trash_msg(self.imap, msg)
+
     #@-node:attribs
     def fsck(self):
 
@@ -1770,12 +1784,12 @@ class Gmailfs(Fuse):
 			if existing['msg'].uid > msgid:
 				# throw away the current message that
 				# we're looking at
-				##imap_trash_msg(self.imap, msg)
 				# and forget that we ever saw it
+				self.fsck_trash_msg(msg)
 				continue
 			else:
 				# throw away the message that was there
-				##imap_trash_msg(self.imap, existing['msg'])
+				self.fsck_trash_msg(existing['msg'])
 				# not stricly necessary, but clearer
 				directory.pop(filename)
 		directory[filename] = dirent_parts
@@ -1810,7 +1824,7 @@ class Gmailfs(Fuse):
 			continue
 		if not path_to_dirent.has_key(parent_path):
 			print "ERROR: could not find parent entry '%s'" % (parent_path)
-			##imap_trash_msg(self.imap, dirent['msg'])
+			self.fsck_trash_msg(dirent['msg'])
 			continue
 
 	print "second dirent pass, bumping refcounts for parent directories..."
@@ -1847,7 +1861,7 @@ class Gmailfs(Fuse):
 		if not inode_refcount.has_key(ino):
 			# FIXME: link into lost+found dir
 			print "ERROR: unlinked inode: '%s'" % (ino)
-			##imap_trash_msg(self.imap, msg)
+			self.fsck_trash_msg(msg)
 			continue
 		if inodes_seen.has_key(ino):
 			existing = inodes_seen[ino]
@@ -1855,12 +1869,12 @@ class Gmailfs(Fuse):
 			if existing['msg'].uid > msgid:
 				# throw away the current message that
 				# we're looking at
-				##imap_trash_msg(self.imap, msg)
+				self.fsck_trash_msg(msg)
 				# and forget that we ever saw it
 				continue
 			else:
 				# throw away the message that was there
-				##imap_trash_msg(self.imap, existing['msg'])
+				self.fsck_trash_msg(existing['msg'])
 				# not stricly necessary, but clearer
 				inodes_seen.pop(ino)
 		inode_parts['msg'] = msg
@@ -1870,11 +1884,14 @@ class Gmailfs(Fuse):
 		counted_nr_links = inode_refcount[ino]
 		if stored_nr_links != counted_nr_links:
 			print "WARNING: ino: %s claims to have %s links, but we counted %s" % (ino, stored_nr_links, counted_nr_links)
+			if "IMAPFS_FSCK_CAN_WRITE" in os.environ:
+				print "fixing inode link count: %s" % (str(ino))
+				inode = GmailInode(msg, self)
+				inode.i_nlink = counted_nr_links
+				inode.mark_dirty("fsck")
+				inode.i_write_out("fsck")
 			continue
 		print "GOOD: linked inode: '%s' i_nlink: %d" % (ino, inode_refcount[ino])
-
-
-
 
 
     class GmailStat(fuse.Stat):
@@ -2392,7 +2409,6 @@ class Gmailfs(Fuse):
 
     #@+node:read
     def read(self, path, readlen, offset):
-	log_entry("read")
         try:
  	    log_debug1("gmailfs.py:Gmailfs:read(len=%d, offset=%d, path='%s')"
 			    % (readlen, offset, path))
@@ -2540,10 +2556,9 @@ class Gmailfs(Fuse):
 	while self.nr_dirty_objects() > 0:
 		print "there are still dirty objects, sleeping..."
 		time.sleep(1)
-	#print "sleeping before fsck"
-	#time.sleep(5)
-	#print "now fscking"
-	#self.fsck()
+	if "IMAPFS_FSCK_ON_FLUSH" in os.environ:
+		print "now fscking"
+		self.fsck()
         return 0
     #@-node:fsync
 
